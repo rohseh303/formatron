@@ -47,23 +47,70 @@ is user-controlled, build the formatter with the hardened KBNF policy:
 formatter = builder.build(vocabulary, tokenizer.decode, hardened=True)
 ```
 
-For custom limits or admission-control telemetry:
+`hardened=True` enables both construction budgets (source/AST size, nesting, string
+tables, regex size estimates and DFA memory, EBNF expansion, simplified grammar size,
+compile deadline) and decode budgets (Earley items per set and per chart, allowed-token
+cache entries). Existing trusted applications are unchanged unless they opt in.
+
+### Admission control
+
+Some JSON Schema keywords amplify inside Formatron's Python generator before the
+engine sees a byte (`maxItems` enumerates one production per count, `minLength`/
+`maxLength` become counted-repetition DFAs, wide `enum` lists become huge
+alternations). `formatron.security` checks the schema first, then the generated
+grammar, and reports every rejection as a machine-readable `LimitViolation`:
 
 ```python
-from formatron.security import hardened_engine_config, inspect_grammar
+from formatron.security import admit_json_schema, SchemaLimits, hardened_engine_config
+from formatron.isolation import IsolatedGrammarChecker
 
-config = hardened_engine_config(
-    max_source_bytes=64_000,
-    max_compile_millis=1_000,
-    regex_memory_bytes=16 * 1024 * 1024,
-)
-complexity = inspect_grammar(generated_kbnf)
-formatter = builder.build(vocabulary, tokenizer.decode, engine_config=config)
+checker = IsolatedGrammarChecker(timeout_s=2.0, memory_bytes=1 << 30)  # one warm worker
+result = admit_json_schema(user_schema, checker=checker)
+if not result.admitted:
+    # result.outcome in {"rejected", "invalid", "timeout", "crashed"}
+    # result.violation -> phase, resource, observed, limit, path
+    return http_400(result.to_dict())
+formatter = builder.build(vocabulary, tokenizer.decode, hardened=True)
 ```
 
-The policy rejects excessive source/AST size, nesting, regex input and DFA memory,
-estimated EBNF expansion, simplified production/symbol counts, and cooperative
-compile time. Existing trusted applications remain unchanged unless they opt in.
+`IsolatedGrammarChecker` runs the full grammar check in a disposable worker process
+with a hard wall-clock timeout and best-effort OS memory/CPU limits, so a grammar that
+defeats the in-process limits costs one killed worker instead of a stalled model
+server. `SchemaLimits.hardened()` and `hardened_engine_config(**overrides)` expose
+every limit for tuning; `check_json_schema`, `check_grammar`, and `inspect_grammar`
+give the raw measurements for telemetry.
+
+### Generator correctness fixes in this fork
+
+The adversarial benchmark exposed defects in the upstream JSON generator that matter as
+soon as schemas are untrusted, all fixed here:
+
+- **Grammar injection.** Property names, `enum`/`const` values, and `pattern` strings
+  were spliced into KBNF literals with `repr()`-based quoting; a value containing `'`
+  terminated the literal and the remainder was parsed as grammar. Literals are now
+  JSON-encoded, regex-escaped, and KBNF-escaped (`formatron.formats.json.json_literal_term`).
+- **Enum/const values as regexes.** `{"enum": ["+"]}` matched four quote characters and
+  never `"+"`; values now match their exact JSON encoding.
+- **Optional members.** A non-required property emitted its key with an optional value
+  (`"b": ,`); optional members are now omitted as a whole, using a chain of rules that
+  keeps grammar size linear instead of the 2^n expansion a production with many
+  nullable symbols caused during simplification.
+- **Bounded arrays.** `minItems`/`maxItems`/`prefixItems` dropped the item schema and
+  accepted any JSON value.
+
+Non-zero numeric bounds (`minimum: 1`) remain unsupported by the generator and are
+reported as `invalid` rather than silently ignored.
+
+### Proxy and benchmark
+
+- `python -m formatron.proxy --upstream http://vllm:8000` runs an OpenAI-compatible
+  admission proxy that applies the policy to `response_format`, `guided_json`,
+  `guided_regex`, `guided_choice`, and `guided_grammar` before forwarding a request.
+  See [`src/formatron/proxy/README.md`](src/formatron/proxy/README.md).
+- [`benchmarks/grammar_guard`](benchmarks/grammar_guard) generates 1,000+ normal and
+  adversarial schemas and measures admission, compile latency, per-token mask latency,
+  output validity, and crash resistance for the hardened policy, the unlimited default,
+  XGrammar, and llguidance.
 
 Install the hardened engine before this fork while it remains source-only:
 
@@ -72,9 +119,9 @@ pip install "kbnf @ git+https://github.com/rohseh303/kbnf.git@grammar-guard"
 pip install "formatron @ git+https://github.com/rohseh303/formatron.git@grammar-guard"
 ```
 
-In-process limits are defense in depth, not a hard sandbox. Compile arbitrary
-grammars in a worker process with operating-system time and memory limits. Semantic
-field constraints are intentionally deferred to a separate second phase.
+In-process limits are defense in depth, not a hard sandbox; use the isolated checker
+for arbitrary grammars. Semantic field constraints are intentionally deferred to a
+separate second phase.
 
 ## Comparison to other libraries
 

@@ -474,6 +474,19 @@ class FormatterBuilder:
 
     
 
+    def grammar_string(self) -> str:
+        """
+        Return the complete KBNF grammar this builder would compile, without building an engine.
+
+        This is what admission control checks (see `formatron.security`) before any
+        vocabulary-dependent work happens. The builder is not consumed.
+        """
+        assert len(
+            self._main_rule) != 0, "An empty formatter builder cannot build!"
+        rules = copy(self._rules)
+        rules.append(f"start ::= {' '.join(self._main_rule)};")
+        return "\n".join(rules)
+
     def build(self, vocabulary: kbnf.Vocabulary,
               decode: typing.Callable[[list[int]], str],
               engine_config: kbnf.Config = None,
@@ -491,8 +504,6 @@ class FormatterBuilder:
         Returns:
             The formatter.
         """
-        assert len(
-            self._main_rule) != 0, "An empty formatter builder cannot build!"
         if hardened:
             if engine_config is not None:
                 raise ValueError(
@@ -500,9 +511,7 @@ class FormatterBuilder:
                     "pass hardened_engine_config(...) as engine_config instead"
                 )
             engine_config = hardened_engine_config()
-        rules = copy(self._rules)
-        rules.append(f"start ::= {' '.join(self._main_rule)};")
-        grammar_str = "\n".join(rules)
+        grammar_str = self.grammar_string()
         # print(grammar_str)
         engine = kbnf.Engine(grammar_str, vocabulary, engine_config)
         extractors = copy(self._extractors)

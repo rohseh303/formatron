@@ -3,6 +3,7 @@ The module defines the `JsonExtractor` class, which is used to extract data from
 """
 import collections
 import decimal
+import json
 import types
 import typing
 
@@ -41,9 +42,64 @@ array_begin ::= #"{SPACE_NONTERMINAL}\\[";
 array_end ::= #"{SPACE_NONTERMINAL}\\]";
 """
 
+_REGEX_METACHARACTERS = frozenset("\\.^$|?*+()[]{}")
+
+
+def regex_escape(text: str) -> str:
+    """
+    Escape every regex metacharacter in `text` so it matches literally.
+    """
+    return "".join(f"\\{c}" if c in _REGEX_METACHARACTERS else c for c in text)
+
+
+def kbnf_string_escape(text: str) -> str:
+    """
+    Escape `text` for the inside of a single-quoted KBNF string literal (`'...'` or `#'...'`).
+
+    Backslashes and single quotes are escaped and control characters are written as
+    KBNF escapes, so no input can terminate the literal early. Regex metacharacters are
+    *not* escaped here; use `regex_escape` first when the text must match literally.
+    """
+    result = []
+    for c in text:
+        code = ord(c)
+        if c == "\\":
+            result.append("\\\\")
+        elif c == "'":
+            result.append("\\'")
+        elif c == "\n":
+            result.append("\\n")
+        elif c == "\t":
+            result.append("\\t")
+        elif c == "\r":
+            result.append("\\r")
+        elif code < 0x20 or code == 0x7F:
+            result.append(f"\\u{code:04x}")
+        else:
+            result.append(c)
+    return "".join(result)
+
+
+def kbnf_regex_term(pattern: str, *, leading_space: bool = True) -> str:
+    """
+    Wrap a raw regex pattern as a KBNF regex terminal, optionally allowing leading JSON whitespace.
+    """
+    prefix = SPACE_NONTERMINAL if leading_space else ""
+    return f"#'{prefix}{kbnf_string_escape(pattern)}'"
+
+
+def json_literal_term(value: typing.Any) -> str:
+    """
+    A KBNF terminal matching exactly the JSON encoding of `value` (a string, number, bool, or None),
+    with leading JSON whitespace allowed.
+    """
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return kbnf_regex_term(regex_escape(text))
+
+
 def from_str_to_kbnf_str(s: str) -> str:
     """
-    Convert a string to a kbnf string.
+    Convert a string to a kbnf terminal matching its JSON string encoding.
 
     Args:
         s: The string to convert.
@@ -51,8 +107,46 @@ def from_str_to_kbnf_str(s: str) -> str:
     Returns:
         The kbnf string.
     """
-    s = f"\"{repr(s)[1:-1]}\""
-    return f"#'{SPACE_NONTERMINAL}{s}'"
+    return json_literal_term(s)
+
+
+def _object_rules(nonterminal: str, pairs: list[tuple[str, bool]]) -> str:
+    """
+    Emit the rules for an object whose members appear in schema order and whose optional
+    members may be omitted entirely (key and value).
+
+    A chain of `tail` nonterminals is used so that every production contains at most one
+    optional group: the grammar stays linear in the number of members instead of the
+    exponential blow-up that a production with many nullable symbols causes during
+    simplification.
+
+    Args:
+        nonterminal: The object's nonterminal.
+        pairs: `(pair_text, required)` per member, in order; `pair_text` is `key colon value`.
+    """
+    n = len(pairs)
+    if n == 0:
+        return f"{nonterminal} ::= object_begin object_end;\n"
+    required_after = [False] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        required_after[i] = pairs[i][1] or required_after[i + 1]
+
+    def tail(i: int) -> str:
+        return escape_identifier(f"{nonterminal}_tail{i}")
+
+    lines = [f"{nonterminal} ::= object_begin {tail(0)}{'' if required_after[0] else '?'} object_end;\n"]
+    for i, (pair, required) in enumerate(pairs):
+        alternatives = []
+        if i == n - 1:
+            alternatives.append(pair)
+        elif required_after[i + 1]:
+            alternatives.append(f"{pair} comma {tail(i + 1)}")
+        else:
+            alternatives.append(f"{pair} (comma {tail(i + 1)})?")
+        if not required and i < n - 1:
+            alternatives.append(tail(i + 1))
+        lines.append(f"{tail(i)} ::= {' | '.join(alternatives)};\n")
+    return "".join(lines)
 
 _type_to_nonterminals = []
 
@@ -80,27 +174,21 @@ def _register_all_predefined_types():
     def schema(current: typing.Type, nonterminal: str):
         if isinstance(current, type) and not isinstance(current, types.GenericAlias) \
                 and issubclass(current, schemas.schema.Schema):
-            line = [f"{nonterminal} ::= ", "object_begin "]
             result = []
-            fields = []
+            pairs = []
             for field, _field_info in current.fields().items():
-                field_name = f"{nonterminal}_{field}"
-                field_name = escape_identifier(field_name)
+                field_name = escape_identifier(f"{nonterminal}_{field}")
                 key = from_str_to_kbnf_str(field)
-                fields.append(f"{key} colon {field_name}")
+                pairs.append((f"{key} colon {field_name}", _field_info.required))
                 result.append((_field_info, field_name))
-            line.append(" comma ".join(fields))
-            line.append(" object_end;\n")
-            return "".join(line), result
+            return _object_rules(nonterminal, pairs), result
         return None
 
     def field_info(current: typing.Type, nonterminal: str):
         if isinstance(current, schemas.schema.FieldInfo):
-            annotation = current.annotation
-            if current.required:
-                return "", [(annotation, nonterminal)]
-            new_nonterminal = f"{nonterminal}_required"
-            return f"{nonterminal} ::= {new_nonterminal}?;\n", [(annotation, new_nonterminal)]
+            # Optional members are omitted as a whole (key and value) by `_object_rules`;
+            # emitting an optional *value* produced invalid JSON such as `"b": ,`.
+            return "", [(current.annotation, nonterminal)]
         return None
 
     def string_metadata(current: typing.Type, nonterminal: str):
@@ -119,7 +207,6 @@ def _register_all_predefined_types():
                 else:
                     print(f"Warning: pattern '{pattern}' contains unescaped anchors (^, $, \\A, \\z) which are not allowed in schema {current} from {nonterminal}")
                     pattern = pattern.strip('^$')
-            pattern = repr(pattern)[1:-1]
             if strict_schema:
                 assert not (min_length or max_length or substring_of), "pattern is mutually exclusive with min_length, max_length and substring_of"
             else:
@@ -147,8 +234,8 @@ def _register_all_predefined_types():
             return fr"""{nonterminal} ::= #'{SPACE_NONTERMINAL}"([^\\\\"\u0000-\u001f]|\\\\["\\\\bfnrt/]|\\\\u[0-9A-Fa-f]{{4}}){repetition}"';
 """, []
         if pattern is not None:
-            pattern = pattern.replace("'", "\\'")
-            return f"""{nonterminal} ::= #'{SPACE_NONTERMINAL}"{pattern}"';\n""", []
+            quoted_pattern = '"(?:' + pattern + ')"'  # group so a top-level `|` stays inside the quotes
+            return f"{nonterminal} ::= {kbnf_regex_term(quoted_pattern)};\n", []
         if substring_of is not None:
             return f"""{nonterminal} ::= #'{SPACE_NONTERMINAL}' '"' #substrs{repr(substring_of)} '"';\n""", []
     
@@ -181,79 +268,58 @@ def _register_all_predefined_types():
         min_items = current.metadata.get("min_length")
         max_items = current.metadata.get("max_length")
         prefix_items = current.metadata.get("prefix_items")
-        additional_items = current.metadata.get("additional_items")
-        if max_items is not None and prefix_items is not None and max_items <= len(prefix_items): # truncate prefix items
-            prefix_items = prefix_items[:max_items+1]
-        if prefix_items:
-            if not min_items: # json schema defaults to 0
-                min_items = 0
-            if not additional_items:
-                if min_items > len(prefix_items):
-                    raise ValueError(f"min_items {min_items} is greater than the number of prefix_items {len(prefix_items)} and additional_items is not allowed")
-                max_items = len(prefix_items)
-        if min_items is not None or max_items is not None: # prefix items will set min
-            new_nonterminal = f"{nonterminal}_item"
-            ebnf_rules = []
-            if min_items is None:
-                min_items = 0
-            if min_items == 0 and max_items is None and prefix_items is None: # no special handling needed
-                return "", [(current.type, new_nonterminal)]
-            prefix_items_nonterminals = [f"{new_nonterminal}_{i}" for i in range(len(prefix_items))] if prefix_items else []
-            prefix_items_parts = [] # contains the sequence of nonterminals for prefix items from min_items to len(prefix_items)
-            if prefix_items is not None:
-                for i in range(max(min_items,1), len(prefix_items)+1):
-                    prefix_items_parts.append(prefix_items_nonterminals[:i])
-                if min_items == 0: # EMPTY_PREFIX_ITEMS_ALLOWED
-                    ebnf_rules.append(f"{nonterminal} ::= array_begin array_end;")
-            if max_items is None: # unbounded
-                if not prefix_items:
-                    min_items_part = ' comma '.join([new_nonterminal] * (min_items - 1))
-                    ebnf_rules.append(f"{nonterminal} ::= array_begin {min_items_part} comma {new_nonterminal}+ array_end;")
-                elif len(prefix_items_parts) >= min_items: # this part assumes prefix items are not empty, so we need the EMPTY_PREFIX_ITEMS_ALLOWED check above
-                    for prefix_items_part in prefix_items_parts:
-                        prefix_items_part = ' comma '.join(prefix_items_part)
-                    ebnf_rules.append(f"{nonterminal} ::= array_begin {prefix_items_part} (comma {new_nonterminal})* array_end;")
+        additional_items = current.metadata.get("additional_items", True)
+        if min_items is None and max_items is None and prefix_items is None:
+            return None
+        min_items = int(min_items or 0)
+        prefix = tuple(prefix_items or ())
+        prefix_len = len(prefix)
+        if not additional_items:
+            if min_items > prefix_len:
+                raise ValueError(f"min_items {min_items} is greater than the number of prefix_items {prefix_len} and additional_items is not allowed")
+            max_items = prefix_len if max_items is None else min(max_items, prefix_len)
+        if max_items is not None and max_items < min_items:
+            raise ValueError(f"max_items {max_items} is smaller than min_items {min_items}")
+        args = typing.get_args(current.type)
+        item_type = args[0] if args else typing.Any
+        item_nonterminal = f"{nonterminal}_item"
+        prefix_nonterminals = [f"{item_nonterminal}_{i}" for i in range(prefix_len)]
+        rules = []
+        alternatives = []
+
+        def optional_chain(count: int) -> str:
+            """A nonterminal accepting between 0 and `count` further `comma item` pairs, as a
+            chain of rules so grammar size stays linear and no production nests optionals."""
+            names = [f"{item_nonterminal}_more{k}" for k in range(1, count + 1)]
+            for k, name in enumerate(names, start=1):
+                continuation = f" {names[k - 2]}" if k > 1 else ""
+                rules.append(f"{name} ::= (comma {item_nonterminal}{continuation})?;")
+            return names[-1]
+
+        # Lengths that end inside the prefix (including the empty array when allowed).
+        upper = prefix_len if max_items is None else min(prefix_len, max_items)
+        for length in range(min_items, upper + 1):
+            alternatives.append(" comma ".join(prefix_nonterminals[:length]))
+        uses_item = max_items is None or max_items > prefix_len
+        if uses_item:
+            head = prefix_nonterminals + [item_nonterminal] * max(min_items - prefix_len, 0)
+            if max_items is None:
+                if head:
+                    alternatives.append(f"{' comma '.join(head)} (comma {item_nonterminal})*")
                 else:
-                    min_items_part = ' comma '.join([new_nonterminal] * (min_items - len(prefix_items_nonterminals)-1))
-                    if  min_items_part:
-                        min_items_part = "comma " + min_items_part
-                    prefix_items_part = ' comma '.join(prefix_items_nonterminals)
-                    ebnf_rules.append(f"{nonterminal} ::= array_begin {prefix_items_part} {min_items_part} comma {new_nonterminal}+ array_end;")
-            elif min_items == 0 and not prefix_items: # TAG: ONLY_MAX_ITEMS
-                for i in range(min_items, max_items + 1):
-                    items = ' comma '.join([new_nonterminal] * i)
-                    ebnf_rules.append(f"{nonterminal} ::= array_begin {items} array_end;")
+                    alternatives.append(f"{item_nonterminal} (comma {item_nonterminal})*")
             else:
-                prefix_items_num = len(prefix_items_nonterminals)
-                if prefix_items:
-                    for prefix_items_part in prefix_items_parts:
-                        prefix_items_part = ' comma '.join(prefix_items_part)
-                        ebnf_rules.append(f"{nonterminal} ::= array_begin {prefix_items_part} array_end;")
-                min_items_part = ' comma '.join([new_nonterminal] * (min_items - prefix_items_num))
-                prefix_items_part = ' comma '.join(prefix_items_nonterminals)
-                if min_items_part and prefix_items_part:
-                    ebnf_rules.append(f"{nonterminal}_min ::= {prefix_items_part} comma {min_items_part};")
-                elif min_items_part:
-                    ebnf_rules.append(f"{nonterminal}_min ::= {min_items_part};")
-                elif prefix_items_part:
-                    ebnf_rules.append(f"{nonterminal}_min ::= {prefix_items_part};")
-                # sanity check: if prefix_items_part and min_items_part are both empty, we will in ONLY_MAX_ITEMS branch above
-                common = max(min_items, prefix_items_num)
-                for i in range(1, max_items + 1 - common):
-                    items = ' comma '.join([new_nonterminal] * i)
-                    ebnf_rules.append(f"{nonterminal} ::= array_begin {nonterminal}_min comma {items} array_end;")  
-            # Handle the item type
-            args = typing.get_args(current.type)
-            if args:
-                item_type = args[0]
-            else:
-                # If args is empty, default to Any
-                item_type = typing.Any
-            if prefix_items:
-                return "\n".join(ebnf_rules) + "\n", list(zip(prefix_items, prefix_items_nonterminals)) + [(item_type, new_nonterminal)]
-            return "\n".join(ebnf_rules) + "\n", [(item_type, new_nonterminal)]
-        return None
-    
+                if not head:
+                    head = [item_nonterminal]
+                optional = max_items - len(head)
+                tail = f" {optional_chain(optional)}" if optional > 0 else ""
+                alternatives.append(f"{' comma '.join(head)}{tail}")
+        rules.insert(0, f"{nonterminal} ::= " + " | ".join(f"array_begin {alt} array_end" for alt in alternatives) + ";")
+        pending = list(zip(prefix, prefix_nonterminals))
+        if uses_item:
+            pending.append((item_type, item_nonterminal))
+        return "\n".join(rules) + "\n", pending
+
     def is_sequence_like(current: typing.Type) -> bool:
         """
         Check if the given type is sequence-like.
@@ -365,14 +431,8 @@ def _register_all_predefined_types():
             new_items = []
             result = []
             for i, arg in enumerate(args):
-                if isinstance(arg, str):
-                    new_items.append(from_str_to_kbnf_str(arg))
-                elif isinstance(arg, bool):
-                    new_items.append(f'#"{SPACE_NONTERMINAL}{str(arg).lower()}"')
-                elif isinstance(arg, int):
-                    new_items.append(f'#"{SPACE_NONTERMINAL}{str(arg)}"')
-                elif isinstance(arg, float):
-                    new_items.append(f'#"{SPACE_NONTERMINAL}{str(arg)}"')
+                if isinstance(arg, (str, bool, int, float)):
+                    new_items.append(json_literal_term(arg))
                 elif arg is None:
                     new_items.append("null")
                 elif isinstance(arg, tuple):

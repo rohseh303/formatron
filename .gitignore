@@ -154,3 +154,5 @@ cython_debug/
 # pyenv
 .python-version
 tests/local_assets
+# raw per-schema benchmark records (several MB per run); RESULTS.md is committed instead
+benchmarks/grammar_guard/results/*.jsonl

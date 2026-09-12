@@ -44,7 +44,7 @@ class FieldInfo(schemas.schema.FieldInfo):
     
 _counter = 0
 
-def create_schema(schema: dict[str, typing.Any], registry=Registry()) -> schemas.schema.Schema:
+def create_schema(schema: dict[str, typing.Any], registry=Registry(), *, limits: typing.Any = None) -> schemas.schema.Schema:
     """
     Create a Schema object from a JSON schema object.
 
@@ -83,6 +83,9 @@ def create_schema(schema: dict[str, typing.Any], registry=Registry()) -> schemas
         schema: A dictionary representing a valid JSON schema. 
         registry: A Registry object containing additional schema definitions. 
                                        Defaults to an empty Registry.
+        limits: Optional `formatron.security.SchemaLimits`. When given, the schema is measured
+                and rejected with `formatron.security.ResourceLimitExceeded` before any
+                conversion work, which bounds the amplification some keywords cause.
 
     Returns:
         schemas.schema.Schema: A Schema object representing the input JSON schema.
@@ -91,6 +94,9 @@ def create_schema(schema: dict[str, typing.Any], registry=Registry()) -> schemas
         jsonschema.exceptions.ValidationError: If the input schema is not a valid JSON Schema.
         ValueError: If there are issues with schema references, constraints or requirements.
     """
+    if limits is not None:
+        from formatron.security import check_json_schema
+        check_json_schema(schema, limits)
     schema = copy.deepcopy(schema)
     _validate_json_schema(schema)
     registry = Resource.from_contents(schema) @ registry
@@ -194,7 +200,11 @@ def _infer_type(schema: dict[str, typing.Any], json_schema_id_to_schema: dict[in
 def _get_literal(schema: dict[str, typing.Any]) -> typing.Any:
     if "enum" in schema and "const" in schema:
         raise ValueError("JSON schema cannot contain both 'enum' and 'const' keywords")
-    return tuple(schema["enum"]) if "enum" in schema else schema.get("const")
+    if "enum" in schema:
+        return tuple(schema["enum"])
+    if "const" in schema:
+        return (schema["const"],)  # a 1-tuple so `"const": null` is a literal, not "no literal"
+    return None
 
 def _handle_literal(literal: typing.Any, obtained_type: typing.Type, schema: dict[str, typing.Any], json_schema_id_to_schema: dict[int, typing.Type]) -> typing.Type:
     # TODO: validate literal against obtained_type
@@ -275,7 +285,8 @@ def _handle_list_metadata(schema: dict[str, typing.Any], json_schema_id_to_schem
     if metadata:
         if "additional_items" not in metadata:
             metadata["additional_items"] = True
-        return schemas.schema.TypeWithMetadata(list, metadata)
+        # Keep the item type: dropping it made every bounded array accept arbitrary JSON values.
+        return schemas.schema.TypeWithMetadata(list[item_type], metadata)
     return list[item_type]
 
 
