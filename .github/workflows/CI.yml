@@ -2,11 +2,34 @@ name: CI
 
 on:
   push:
-    branches:
-      - master
+  pull_request:
 
 jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the hardened kbnf fork from source
+        run: pip install "kbnf @ git+https://github.com/rohseh303/kbnf.git@grammar-guard"
+      - name: Install formatron with test and proxy extras
+        run: |
+          pip install -e ".[proxy]"
+          pip install pytest pytest-timeout snapshottest jsonschema hypothesis numpy
+      - name: Run hardened-policy, isolation, proxy, and grammar-generation tests
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            tests/test_security.py tests/test_isolation.py tests/test_proxy.py \
+            tests/test_grammar_guard_bench.py tests/test_grammar_gen.py \
+            --deselect tests/test_grammar_gen.py::test_infer_mapping
   doc-build:
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
