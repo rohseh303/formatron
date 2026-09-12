@@ -14,6 +14,7 @@ from formatron.formats.json import JsonExtractor
 from formatron.schemas.schema import Schema
 from formatron.extractor import Extractor, LiteralExtractor, NonterminalExtractor, ChoiceExtractor, SubstringExtractor
 from formatron.formats.regex import RegexComplementExtractor, RegexExtractor
+from formatron.security import hardened_engine_config
 
 
 
@@ -475,7 +476,8 @@ class FormatterBuilder:
 
     def build(self, vocabulary: kbnf.Vocabulary,
               decode: typing.Callable[[list[int]], str],
-              engine_config: kbnf.Config = None) -> Formatter:
+              engine_config: kbnf.Config = None,
+              *, hardened: bool = False) -> Formatter:
         """
         Build a formatter from the builder. The builder will not be consumed and can be used again.
 
@@ -483,11 +485,21 @@ class FormatterBuilder:
             vocabulary: The KBNF engine vocabulary for the formatter.
             decode: The callback to decode the token IDs to a string.
             engine_config: The KBNF engine configuration.
+            hardened: Apply conservative resource limits for a format derived from
+                user input. Cannot be combined with ``engine_config``; use
+                ``hardened_engine_config`` to customize the limits instead.
         Returns:
             The formatter.
         """
         assert len(
             self._main_rule) != 0, "An empty formatter builder cannot build!"
+        if hardened:
+            if engine_config is not None:
+                raise ValueError(
+                    "hardened=True cannot be combined with engine_config; "
+                    "pass hardened_engine_config(...) as engine_config instead"
+                )
+            engine_config = hardened_engine_config()
         rules = copy(self._rules)
         rules.append(f"start ::= {' '.join(self._main_rule)};")
         grammar_str = "\n".join(rules)

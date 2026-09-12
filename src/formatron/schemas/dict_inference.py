@@ -3,9 +3,8 @@ This module contains utilities for inferring schemas from dictionaries.
 """
 import collections.abc
 import json
+import typing
 from typing import Any, Type
-
-from pydantic import typing
 
 from formatron import schemas
 

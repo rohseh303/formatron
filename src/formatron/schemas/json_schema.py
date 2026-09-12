@@ -6,10 +6,10 @@ import collections
 import collections.abc
 import copy
 import json
+import typing
 from urllib.parse import urldefrag, urljoin
 import frozendict
 import jsonschema.validators
-from pydantic import typing
 import jsonschema
 from formatron import schemas
 from referencing import Registry, Resource

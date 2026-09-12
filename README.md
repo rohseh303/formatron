@@ -37,6 +37,45 @@ aymptotically and practically the fastest algorithm.
 - **🔧 Customizable**: Everything is configurable, including schema generation,
 grammar generation, and post-generation processing (such as function calls).
 
+## Custom formats in a multi-tenant service
+
+Formatron can generate a grammar from each user's schema without spending model
+tokens teaching the model to imitate that schema. When the schema or format itself
+is user-controlled, build the formatter with the hardened KBNF policy:
+
+```python
+formatter = builder.build(vocabulary, tokenizer.decode, hardened=True)
+```
+
+For custom limits or admission-control telemetry:
+
+```python
+from formatron.security import hardened_engine_config, inspect_grammar
+
+config = hardened_engine_config(
+    max_source_bytes=64_000,
+    max_compile_millis=1_000,
+    regex_memory_bytes=16 * 1024 * 1024,
+)
+complexity = inspect_grammar(generated_kbnf)
+formatter = builder.build(vocabulary, tokenizer.decode, engine_config=config)
+```
+
+The policy rejects excessive source/AST size, nesting, regex input and DFA memory,
+estimated EBNF expansion, simplified production/symbol counts, and cooperative
+compile time. Existing trusted applications remain unchanged unless they opt in.
+
+Install the hardened engine before this fork while it remains source-only:
+
+```shell
+pip install "kbnf @ git+https://github.com/rohseh303/kbnf.git@grammar-guard"
+pip install "formatron @ git+https://github.com/rohseh303/formatron.git@grammar-guard"
+```
+
+In-process limits are defense in depth, not a hard sandbox. Compile arbitrary
+grammars in a worker process with operating-system time and memory limits. Semantic
+field constraints are intentionally deferred to a separate second phase.
+
 ## Comparison to other libraries
 
 | Capability                                   | Formatron                          | [LM Format Enforcer](https://github.com/noamgat/lm-format-enforcer)                           | [Guidance](https://github.com/guidance-ai/guidance) | [Outlines](https://github.com/outlines-dev/outlines)                                    | [LMQL](https://github.com/eth-sri/lmql)                                                         |
