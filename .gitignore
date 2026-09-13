@@ -156,3 +156,6 @@ cython_debug/
 tests/local_assets
 # raw per-schema benchmark records (several MB per run); RESULTS.md is committed instead
 benchmarks/grammar_guard/results/*.jsonl
+
+# demo run logs; TRANSCRIPT.md is regenerated from them
+examples/grammar_guard_demo/logs/
