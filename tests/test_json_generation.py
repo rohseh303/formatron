@@ -6,7 +6,7 @@ import json
 import kbnf
 import pytest
 
-from formatron.formats.json import json_literal_term, kbnf_string_escape, regex_escape
+from formatron.formats.json import json_literal_term, json_safe_pattern, kbnf_string_escape, regex_escape
 from formatron.security import SchemaLimits, check_grammar, grammar_for_schema, hardened_json_schema
 
 BYTE_VOCAB = kbnf.Vocabulary(
@@ -177,3 +177,14 @@ def test_numeric_ranges_are_enforced_textually(schema, accepted, rejected):
 def test_empty_numeric_range_is_reported():
     with pytest.raises(ValueError, match="empty"):
         _grammar({"n": {"type": "integer", "minimum": 5, "maximum": 4}}, required=["n"])
+
+
+def test_pattern_dot_cannot_break_the_json_string():
+    assert json_safe_pattern("a.b").startswith('a(?:[^"')
+    assert json_safe_pattern("a\\.b") == "a\\.b"
+    assert json_safe_pattern("[.]x") == "[.]x"
+    grammar = _grammar({"s": {"type": "string", "pattern": ".{3,5}"}}, required=["s"])
+    assert _accepts(grammar, '{"s":"abc"}\n')
+    assert _accepts(grammar, '{"s":"a\\"bc"}\n')  # an escaped quote is two chars of raw text
+    _assert_rejects(grammar, '{"s":"a"bc"}\n')
+    _assert_rejects(grammar, '{"s":"a\tbc"}\n')

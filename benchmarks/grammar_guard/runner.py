@@ -10,12 +10,21 @@ Results are appended to ``results/<config>.jsonl`` (``hardened.jsonl`` /
 ``default.jsonl`` for kbnf, ``xgrammar.jsonl`` / ``llguidance.jsonl`` for the
 external engines) and the run is resumable: ids already present are skipped.
 
+With ``--tokenizer <hf-id>`` the kbnf configs run on that tokenizer's *real*
+vocabulary instead of the synthetic one: the parent loads the Hugging Face
+tokenizer once, builds the ``kbnf.Vocabulary`` the way Formatron's
+``create_engine_vocabulary`` does and pickles the raw maps to
+``results/vocab-<name>.pkl``; every child reconstructs the vocabulary from that
+file.  Results then go to ``results/<config>-<name>.jsonl``
+(``hardened-qwen2.5.jsonl``), leaving the synthetic runs untouched.
+
 Examples::
 
     python -m benchmarks.grammar_guard.runner --config hardened
     python -m benchmarks.grammar_guard.runner --config default --timeout 10
     python -m benchmarks.grammar_guard.runner --engines xgrammar,llguidance
     python -m benchmarks.grammar_guard.runner --family patterns --limit 5 --config hardened
+    python -m benchmarks.grammar_guard.runner --config hardened --tokenizer Qwen/Qwen2.5-0.5B-Instruct --timeout 20 --workers 4
 """
 
 from __future__ import annotations
@@ -32,7 +41,7 @@ import threading
 import time
 import typing
 
-from . import corpus, worker
+from . import corpus, vocab, worker
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_RESULTS_DIR = os.path.join(HERE, "results")
@@ -177,8 +186,12 @@ def run_isolated(spec: corpus.Spec, options: dict, watchdog: RssWatchdog | None 
 # --------------------------------------------------------------------------
 
 
-def results_path(results_dir: str, engine: str, config: str) -> str:
+def results_path(results_dir: str, engine: str, config: str, vocab_name: str | None = None) -> str:
+    """``hardened.jsonl`` / ``xgrammar.jsonl`` for the synthetic vocabulary,
+    ``hardened-<vocab_name>.jsonl`` for a real tokenizer vocabulary."""
     name = config if engine == "kbnf" else engine
+    if vocab_name:
+        name = f"{name}-{vocab_name}"
     return os.path.join(results_dir, f"{name}.jsonl")
 
 
@@ -203,7 +216,8 @@ def run_batch(spec_list: list[corpus.Spec], options: dict, out_path: str, worker
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     done = load_done_ids(out_path) if resume else set()
     todo = [s for s in spec_list if s.id not in done]
-    log(f"[{options['engine']}/{options.get('config', 'default')}] {len(todo)} to run, {len(spec_list) - len(todo)} already done -> {out_path}")
+    log(f"[{options['engine']}/{options.get('config', 'default')}/{options.get('vocab_name') or 'synthetic'}] "
+        f"{len(todo)} to run, {len(spec_list) - len(todo)} already done -> {out_path}")
     if not todo:
         return []
     watchdog = RssWatchdog(options.get("mem_mb"))
@@ -235,8 +249,24 @@ def run_batch(spec_list: list[corpus.Spec], options: dict, out_path: str, worker
     return results
 
 
-def build_options(args) -> dict:
-    return {"timeout": args.timeout, "mem_mb": args.mem_mb, "token_cap": args.token_cap, "seed": args.seed}
+def build_options(args, vocab_file: str | None = None, vocab_name: str | None = None) -> dict:
+    return {"timeout": args.timeout, "mem_mb": args.mem_mb, "token_cap": args.token_cap, "seed": args.seed,
+            "workers": args.workers, "vocab_file": vocab_file, "vocab_name": vocab_name}
+
+
+def prepare_vocab(tokenizer: str, results_dir: str, vocab_name: str | None = None, vocab_file: str | None = None,
+                  rebuild: bool = False, log: typing.Callable[[str], None] = print) -> tuple[str, str]:
+    """Build (or reuse) the pickled vocabulary for ``tokenizer``; returns ``(vocab_file, vocab_name)``."""
+    name = vocab_name or vocab.vocab_name_from_tokenizer(tokenizer)
+    path = vocab_file or vocab.default_vocab_file(results_dir, name)
+    meta = None if rebuild else vocab.read_vocab_meta(path)
+    if meta and meta.get("tokenizer") == tokenizer:
+        log(f"[vocab] reusing {path}: {meta['tokenizer']} ({meta['size']:,} tokens, built {meta.get('created')})")
+    else:
+        if meta:
+            log(f"[vocab] {path} was built from {meta.get('tokenizer')!r}, rebuilding for {tokenizer!r}")
+        vocab.build_vocab_file(tokenizer, path, name, log=log)
+    return path, name
 
 
 def main(argv=None):
@@ -249,6 +279,12 @@ def main(argv=None):
     ap.add_argument("--token-cap", type=int, default=512, help="random-walk token budget")
     ap.add_argument("--seed", type=int, default=corpus.SEED)
     ap.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
+    ap.add_argument("--tokenizer", metavar="HF_ID",
+                    help="Hugging Face tokenizer id (e.g. Qwen/Qwen2.5-0.5B-Instruct): run the kbnf configs on its real "
+                         "vocabulary instead of the synthetic one; results go to <config>-<vocab-name>.jsonl")
+    ap.add_argument("--vocab-name", help="label for --tokenizer used in file names (default: derived, e.g. qwen2.5)")
+    ap.add_argument("--vocab-file", help="pickle of the tokenizer vocabulary (default: <results-dir>/vocab-<vocab-name>.pkl)")
+    ap.add_argument("--rebuild-vocab", action="store_true", help="rebuild the vocabulary pickle even if it exists")
     ap.add_argument("--family", action="append", help="restrict to family (repeatable)")
     ap.add_argument("--category", choices=["normal", "adversarial"])
     ap.add_argument("--ids", help="comma separated spec ids")
@@ -262,13 +298,21 @@ def main(argv=None):
                                     ids=args.ids.split(",") if args.ids else None, limit=args.limit,
                                     per_family=args.per_family)
     log = (lambda s: None) if args.quiet else (lambda s: print(s, flush=True))
-    for engine in [e.strip() for e in args.engines.split(",") if e.strip()]:
+    engines = [e.strip() for e in args.engines.split(",") if e.strip()]
+    for engine in engines:
         if engine not in worker.ENGINES:
             ap.error(f"unknown engine {engine!r}; choose from {sorted(worker.ENGINES)}")
-        options = build_options(args)
+    vocab_file = vocab_name = None
+    if args.tokenizer:
+        if any(e != "kbnf" for e in engines):
+            ap.error("--tokenizer is only supported for the kbnf engine (xgrammar/llguidance runs use the synthetic vocabulary)")
+        vocab_file, vocab_name = prepare_vocab(args.tokenizer, args.results_dir, args.vocab_name, args.vocab_file,
+                                               rebuild=args.rebuild_vocab, log=log)
+    for engine in engines:
+        options = build_options(args, vocab_file, vocab_name)
         options["engine"] = engine
         options["config"] = args.config if engine == "kbnf" else "default"
-        out_path = results_path(args.results_dir, engine, options["config"])
+        out_path = results_path(args.results_dir, engine, options["config"], vocab_name)
         run_batch(spec_list, options, out_path, args.workers, log=log, resume=not args.no_resume)
 
 

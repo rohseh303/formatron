@@ -175,6 +175,56 @@ def test_report_builds_from_partial_results(tmp_path):
     assert out.exists() and out.stat().st_size > 1000
 
 
+# ------------------------------------------------------------------ real tokenizer vocabulary (optional)
+
+TOKENIZER_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+
+
+@pytest.fixture(scope="module")
+def qwen_vocab_file(tmp_path_factory):
+    """Pickle the real Qwen2.5 vocabulary once (skips when transformers or the cached tokenizer is missing)."""
+    pytest.importorskip("transformers")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    path = str(tmp_path_factory.mktemp("vocab") / "vocab-qwen2.5.pkl")
+    try:
+        meta = vocab.build_vocab_file(TOKENIZER_ID, path)
+    except Exception as exc:  # OSError from the hub when offline & uncached, or any transformers loading failure
+        pytest.skip(f"tokenizer {TOKENIZER_ID} unavailable: {type(exc).__name__}: {str(exc)[:120]}")
+    assert meta["size"] > 100_000 and meta["missing_single_bytes"] == 0 and meta["id_holes"] == 0
+    return path
+
+
+def test_vocab_name_and_results_path_for_tokenizer(tmp_path):
+    assert vocab.vocab_name_from_tokenizer(TOKENIZER_ID) == "qwen2.5"
+    assert vocab.vocab_name_from_tokenizer("meta-llama/Llama-3.1-8B-Instruct") == "llama"
+    assert runner.results_path(str(tmp_path), "kbnf", "hardened", "qwen2.5").endswith("hardened-qwen2.5.jsonl")
+    assert runner.results_path(str(tmp_path), "kbnf", "default").endswith(os.sep + "default.jsonl")
+    assert vocab.token_table({0: b"a", 2: b"c"}) == (b"a", b"", b"c")
+
+
+def test_worker_runs_on_real_tokenizer_vocabulary(qwen_vocab_file):
+    meta = vocab.read_vocab_meta(qwen_vocab_file)
+    assert meta["tokenizer"] == TOKENIZER_ID and meta["format"] == vocab.VOCAB_FILE_FORMAT
+    tokens, kv, info = worker.load_kbnf_vocabulary({"vocab_file": qwen_vocab_file})
+    assert info["tokenizer"] == TOKENIZER_ID and len(tokens) == info["size"] == kv.get_vocab_size()
+    assert all(bytes([b]) in set(tokens) for b in (ord("{"), ord('"'), 0x00))  # single bytes survive unmangling
+    for spec_id in ("normal/flat_object/0001", "normal/enum_fields/0000"):
+        r = worker.run_in_process(corpus.get(spec_id), _opts(config="hardened", token_cap=256, vocab_file=qwen_vocab_file,
+                                                             vocab_name="qwen2.5"))
+        assert r["outcome"] == "admitted", r.get("reason")
+        assert r["vocab"] == {**r["vocab"], "name": "qwen2.5", "tokenizer": TOKENIZER_ID, "size": meta["size"]}
+        assert r["vocab_size"] == meta["size"] and r["vocab_load_ms"] >= 0 and r["compile_ms"] > 0
+        g = r["generation"]
+        assert g["tokens"] > 0 and g["walk_overhead_ms"] >= 0 and g["allowed_mean"] > 100  # real vocab: big allowed sets
+        if g["completed"]:
+            assert g["output_valid"], g["validation_error"]
+    # the same schema through the isolated spawn child (the child must load the pickle, not the tokenizer)
+    res = runner.run_isolated(corpus.get("normal/flat_object/0001"),
+                              _opts(config="default", timeout=60.0, mem_mb=4096, vocab_file=qwen_vocab_file, vocab_name="qwen2.5"))
+    assert res["outcome"] == "admitted" and res["vocab"]["tokenizer"] == TOKENIZER_ID, res.get("reason")
+
+
 # ------------------------------------------------------------------ external engines (optional)
 
 

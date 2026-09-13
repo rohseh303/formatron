@@ -50,7 +50,9 @@ formatter = builder.build(vocabulary, tokenizer.decode, hardened=True)
 `hardened=True` enables both construction budgets (source/AST size, nesting, string
 tables, regex size estimates and DFA memory, EBNF expansion, simplified grammar size,
 compile deadline) and decode budgets (Earley items per set and per chart, allowed-token
-cache entries). Existing trusted applications are unchanged unless they opt in.
+cache entries, lazily built regex token caches so engine construction no longer scales
+with the tokenizer's vocabulary). Existing trusted applications are unchanged unless
+they opt in.
 
 ### Admission control
 
@@ -97,6 +99,9 @@ soon as schemas are untrusted, all fixed here:
   nullable symbols caused during simplification.
 - **Bounded arrays.** `minItems`/`maxItems`/`prefixItems` dropped the item schema and
   accepted any JSON value.
+- **Pattern dots.** A `pattern` is applied to the raw text between the JSON quotes, so a
+  bare `.` let the model emit a quote or a control character there and break the
+  document; `.` now matches one JSON string character (or one escape sequence).
 
 - **Numeric ranges.** Upstream only understood bounds at zero. `minimum`, `maximum`,
   `exclusiveMinimum`, and `exclusiveMaximum` on integers and decimals are now compiled

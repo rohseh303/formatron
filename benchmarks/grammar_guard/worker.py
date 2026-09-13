@@ -25,12 +25,18 @@ kbnf paths
     builder.build(vocab, decode)               # no limits at all
     random walk
 
-Both configs then run the same biased random walk over the synthetic vocabulary
-and validate the finished document against the original schema.
+Both configs then run the same biased random walk over the vocabulary and
+validate the finished document against the original schema.
+
+The vocabulary is the synthetic ~3k-token one from ``vocab.py`` unless
+``options["vocab_file"]`` names a pickle written by ``vocab.build_vocab_file``
+(``runner.py --tokenizer``), in which case the child reconstructs the real
+tokenizer's ``kbnf.Vocabulary`` from it and decodes with the real token bytes.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 import resource
@@ -313,12 +319,15 @@ def random_walk(formatter, tokens: typing.Sequence[bytes], seed: int, cap: int,
             break
         if steps % 64 == 0:
             progress(f"generate:{steps}")
+    total_ms = _now_ms() - t_start
     return {
         "tokens": steps,
         "completed": completed,
         "hit_token_cap": (not completed and error is None),
         "error": error,
-        "total_ms": _now_ms() - t_start,
+        "total_ms": total_ms,
+        # everything that is not the engine: allowed-list materialisation, sampling, chart probes
+        "walk_overhead_ms": total_ms - sum(mask_ms) - sum(accept_ms),
         "mask_ms": _percentiles(mask_ms),
         "accept_ms": _percentiles(accept_ms),
         "allowed_mean": (sum(allowed_counts) / len(allowed_counts)) if allowed_counts else None,
@@ -382,6 +391,33 @@ def _admission_to_reason(adm) -> dict[str, typing.Any]:
     return reason
 
 
+@functools.lru_cache(maxsize=2)
+def _real_token_table(path: str) -> tuple[bytes, ...]:
+    return vocab.token_table(vocab.load_vocab_file(path)["id_to_bytes"])
+
+
+def load_kbnf_vocabulary(options: dict) -> tuple[typing.Sequence[bytes], typing.Any, dict[str, typing.Any]]:
+    """Return ``(tokens, kbnf.Vocabulary, info)`` for the run's vocabulary.
+
+    ``tokens[id]`` are the raw bytes the walk appends when token ``id`` is
+    sampled.  With ``options["vocab_file"]`` set these are the real tokenizer's
+    bytes (after Formatron's byte-level unmangling); otherwise the synthetic
+    vocabulary.  A fresh ``kbnf.Vocabulary`` is built per call (it is not
+    shareable across processes and must not be shared between engines).
+    """
+    path = options.get("vocab_file")
+    if not path:
+        tokens = vocab.build_vocabulary(tuple(corpus.KEY_POOL))
+        return tokens, vocab.kbnf_vocabulary(tokens), {"name": "synthetic", "tokenizer": None, "size": len(tokens)}
+    data = vocab.load_vocab_file(path)
+    tokens = _real_token_table(path)
+    vocabulary = vocab.kbnf_vocabulary_from_maps(data["id_to_bytes"], data["id_to_str"])
+    info = {"name": options.get("vocab_name") or data["name"], "tokenizer": data["tokenizer"], "size": data["size"],
+            "max_id": data.get("max_id"), "id_holes": data.get("id_holes", 0),
+            "missing_single_bytes": data.get("missing_single_bytes", 0)}
+    return tokens, vocabulary, info
+
+
 def run_kbnf(spec: corpus.Spec, schema: dict, options: dict, progress) -> dict:
     result: dict[str, typing.Any] = {"engine": "kbnf", "config": options["config"], "phase_reached": "start"}
     t_all = _now_ms()
@@ -394,8 +430,11 @@ def run_kbnf(spec: corpus.Spec, schema: dict, options: dict, progress) -> dict:
     from formatron.schemas.json_schema import create_schema
     from formatron.security import admit_json_schema, inspect_grammar
 
-    tokens = vocab.build_vocabulary(tuple(corpus.KEY_POOL))
-    vocabulary = vocab.kbnf_vocabulary(tokens)
+    phase = "vocab"
+    progress(phase)
+    t = _now_ms()
+    tokens, vocabulary, result["vocab"] = load_kbnf_vocabulary(options)
+    result["vocab_load_ms"] = _now_ms() - t
     result["vocab_size"] = len(tokens)
 
     # --- admission (hardened only): SchemaLimits + full hardened grammar check -------
@@ -538,6 +577,7 @@ def run_xgrammar(spec: corpus.Spec, schema: dict, options: dict, progress) -> di
     tokenizer_info = xgrammar.TokenizerInfo(tokens, vocab_type=xgrammar.VocabType.RAW, stop_token_ids=[eos])
     compiler = xgrammar.GrammarCompiler(tokenizer_info, max_threads=1, cache_enabled=False)
     result["vocab_size"] = len(tokens)
+    result["vocab"] = {"name": "synthetic", "tokenizer": None, "size": len(tokens)}
 
     phase = "schema_to_grammar"
     progress(phase)
@@ -580,6 +620,7 @@ def run_llguidance(spec: corpus.Spec, schema: dict, options: dict, progress) -> 
     tokens = vocab.build_vocabulary(tuple(corpus.KEY_POOL))
     tokenizer = llguidance.LLTokenizer(llguidance.TokenizerWrapper(vocab.GreedyTokenizer(tokens)))
     result["vocab_size"] = tokenizer.vocab_size
+    result["vocab"] = {"name": "synthetic", "tokenizer": None, "size": tokenizer.vocab_size}
 
     phase = "schema_to_grammar"
     progress(phase)
@@ -627,7 +668,8 @@ ENGINES = {"kbnf": run_kbnf, "xgrammar": run_xgrammar, "llguidance": run_llguida
 def run_in_process(spec: corpus.Spec, options: dict, progress=lambda phase: None) -> dict:
     """Run one spec in the *current* process (used by the child and by tests)."""
     base = {"id": spec.id, "family": spec.family, "category": spec.category, "expect": spec.expect,
-            "engine": options["engine"], "config": options.get("config", "default")}
+            "engine": options["engine"], "config": options.get("config", "default"),
+            "options": {k: options.get(k) for k in ("timeout", "mem_mb", "token_cap", "workers", "seed")}}
     t = _now_ms()
     schema = corpus.materialize(spec, options.get("seed", corpus.SEED))
     base["materialize_ms"] = _now_ms() - t

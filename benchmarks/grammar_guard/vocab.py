@@ -1,6 +1,9 @@
-"""Synthetic token vocabulary shared by every engine in the benchmark.
+"""Token vocabularies for the benchmark: the synthetic one and real tokenizers.
 
-This is *not* a real model tokenizer.  It is a deterministic, hand-built
+Synthetic vocabulary
+--------------------
+
+The default is *not* a real model tokenizer.  It is a deterministic, hand-built
 vocabulary of ~3-4k tokens: every single byte (so any byte string is
 reachable), JSON punctuation with and without surrounding whitespace, numbers,
 ``true``/``false``/``null``, a few hundred common English words, the key names
@@ -8,18 +11,34 @@ used by the corpus, and common substrings (URL fragments, dates, UUID-ish
 hex, escape sequences, a handful of multi-byte UTF-8 tokens).
 
 Because it is synthetic, absolute per-token mask latencies are not comparable
-with a real 32k-128k BPE vocabulary, and the random walk in the runner can
+with a real 32k-152k BPE vocabulary, and the random walk in the runner can
 produce strings a language model never would.  The numbers are only meaningful
 *relative* to each other (hardened vs default, engine vs engine, family vs
 family).
+
+Real tokenizer vocabulary (``--tokenizer``)
+-------------------------------------------
+
+``build_vocab_file`` loads a Hugging Face tokenizer **once in the parent
+process**, builds the ``kbnf.Vocabulary`` exactly the way Formatron's
+``create_engine_vocabulary`` does (byte-level BPE "Ġ"/"Ċ" mangling and
+sentencepiece "▁" are undone by ``get_original_characters``), and pickles the
+raw ``{id: bytes}`` / ``{id: str}`` maps.  ``kbnf.Vocabulary`` itself is not
+picklable and ``import transformers`` costs ~20 s, so every spawned child
+instead calls ``load_vocab_file`` (~20 ms) and ``kbnf_vocabulary_from_maps``
+(~70 ms for 152k tokens).  The random walk decodes with the real token bytes.
 """
 
 from __future__ import annotations
 
+import datetime
 import functools
+import os
+import pickle
 import typing
 
 EOS_TEXT = b"<|eos|>"
+VOCAB_FILE_FORMAT = 1
 
 _PUNCT = [
     b"{", b"}", b"[", b"]", b",", b":", b'"', b"\\", b"/",
@@ -188,6 +207,130 @@ def kbnf_vocabulary(tokens: typing.Sequence[bytes]):
 
 def decode_bytes(tokens: typing.Sequence[bytes], ids: typing.Iterable[int]) -> bytes:
     return b"".join(tokens[i] for i in ids)
+
+
+# --------------------------------------------------------------------------
+# Real tokenizer vocabularies
+# --------------------------------------------------------------------------
+
+
+def vocab_name_from_tokenizer(tokenizer_id: str) -> str:
+    """``Qwen/Qwen2.5-0.5B-Instruct`` -> ``qwen2.5``; ``meta-llama/Llama-3.1-8B`` -> ``llama``.
+
+    The last path component, lower-cased, up to the first ``-`` (which is where
+    HF ids usually switch from the model family to size/variant).  Override
+    with ``--vocab-name`` when the heuristic is wrong.
+    """
+    tail = tokenizer_id.rstrip("/").split("/")[-1].lower()
+    head = tail.split("-", 1)[0]
+    return "".join(ch for ch in head if ch.isalnum() or ch in "._") or "vocab"
+
+
+def default_vocab_file(results_dir: str, name: str) -> str:
+    return os.path.join(results_dir, f"vocab-{name}.pkl")
+
+
+def build_vocab_file(tokenizer_id: str, path: str, name: str | None = None,
+                     log: typing.Callable[[str], None] = lambda s: None) -> dict:
+    """Load ``tokenizer_id`` with ``transformers``, build the engine vocabulary the
+    way ``formatron.integrations.transformers.create_engine_vocabulary`` does, and
+    pickle the raw maps to ``path``.  Returns the metadata dict (no token maps).
+
+    The ``kbnf.Vocabulary`` returned by ``create_engine_vocabulary`` is built too,
+    to assert that the pickled maps reproduce Formatron's own integration path
+    (same size, same id->string mapping on a sample of ids).
+    """
+    import time
+
+    t0 = time.perf_counter()
+    from transformers import AutoTokenizer  # slow (~20 s): parent process only
+
+    from formatron.integrations.transformers import create_engine_vocabulary
+    from formatron.integrations.utils import get_original_characters
+
+    log(f"[vocab] imported transformers in {time.perf_counter() - t0:.1f} s; loading {tokenizer_id!r}")
+    t1 = time.perf_counter()
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+    raw = tokenizer.get_vocab()  # {str: id}, mangled the way the tokenizer files spell tokens
+    id_to_bytes = get_original_characters(raw)  # {id: bytes}, unmangled (what create_engine_vocabulary feeds kbnf)
+    id_to_str = {token_id: text for text, token_id in raw.items()}
+    engine_vocab = create_engine_vocabulary(tokenizer)
+    size = engine_vocab.get_vocab_size()
+    if size != len(id_to_bytes) or size != len(id_to_str):
+        raise RuntimeError(f"vocabulary size mismatch: kbnf {size}, bytes map {len(id_to_bytes)}, str map {len(id_to_str)}")
+    step = max(1, size // 512)
+    for token_id in list(range(0, size, step)) + [size - 1]:
+        if token_id in id_to_str and engine_vocab.get_token_string(token_id) != id_to_str[token_id]:
+            raise RuntimeError(f"id->string mismatch at token {token_id}")
+    ids = sorted(id_to_bytes)
+    holes = ids[-1] + 1 - len(ids) if ids else 0
+    single_bytes = {b[0] for b in id_to_bytes.values() if len(b) == 1}
+    meta = {
+        "format": VOCAB_FILE_FORMAT,
+        "name": name or vocab_name_from_tokenizer(tokenizer_id),
+        "tokenizer": tokenizer_id,
+        "size": size,
+        "max_id": ids[-1] if ids else -1,
+        "id_holes": holes,
+        "missing_single_bytes": 256 - len(single_bytes),
+        "eos_token_id": getattr(tokenizer, "eos_token_id", None),
+        "tokenizer_class": type(tokenizer).__name__,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump({**meta, "id_to_bytes": id_to_bytes, "id_to_str": id_to_str}, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+    log(f"[vocab] {meta['name']}: {size:,} tokens (max id {meta['max_id']}, {holes} id holes, "
+        f"{meta['missing_single_bytes']} single bytes missing) built in {time.perf_counter() - t1:.1f} s -> {path}")
+    return meta
+
+
+def read_vocab_meta(path: str) -> dict | None:
+    """Metadata of an existing vocab file (``None`` if missing/unreadable)."""
+    try:
+        data = load_vocab_file(path)
+    except (OSError, pickle.UnpicklingError, EOFError, KeyError, ValueError):
+        return None
+    return {k: v for k, v in data.items() if k not in ("id_to_bytes", "id_to_str")}
+
+
+@functools.lru_cache(maxsize=2)
+def load_vocab_file(path: str) -> dict:
+    """Unpickle a vocab file written by ``build_vocab_file`` (cached per path)."""
+    with open(path, "rb") as f:
+        data = pickle.load(f)
+    if data.get("format") != VOCAB_FILE_FORMAT or "id_to_bytes" not in data or "id_to_str" not in data:
+        raise ValueError(f"{path} is not a GrammarGuard vocab file (format {data.get('format')!r})")
+    return data
+
+
+def token_table(id_to_bytes: dict[int, bytes]) -> tuple[bytes, ...]:
+    """Dense ``tokens[id] -> bytes`` table (holes in the id space become ``b""``)."""
+    if not id_to_bytes:
+        return ()
+    table = [b""] * (max(id_to_bytes) + 1)
+    for token_id, raw in id_to_bytes.items():
+        table[token_id] = raw
+    return tuple(table)
+
+
+def kbnf_vocabulary_from_maps(id_to_bytes: dict[int, bytes], id_to_str: dict[int, str]):
+    """Reconstruct the ``kbnf.Vocabulary`` a child needs from the pickled maps."""
+    import kbnf
+
+    return kbnf.Vocabulary({k: kbnf.Token(v) for k, v in id_to_bytes.items()}, dict(id_to_str))
+
+
+def vocab_meta_from_options(options: dict) -> dict:
+    """Small ``vocab`` descriptor stored in every result row."""
+    path = options.get("vocab_file")
+    if not path:
+        return {"name": "synthetic", "tokenizer": None}
+    meta = read_vocab_meta(path) or {}
+    return {"name": options.get("vocab_name") or meta.get("name") or "unknown", "tokenizer": meta.get("tokenizer"),
+            "size": meta.get("size")}
 
 
 class GreedyTokenizer:

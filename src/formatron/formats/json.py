@@ -82,6 +82,44 @@ def kbnf_string_escape(text: str) -> str:
     return "".join(result)
 
 
+# Regex text for one JSON string character: any char except `"`, `\\` and controls, or a JSON escape.
+_JSON_STRING_CHAR = '(?:[^"\\\\\\x00-\\x1f]|\\\\["\\\\/bfnrt]|\\\\u[0-9A-Fa-f]{4})'
+
+
+def json_safe_pattern(pattern: str) -> str:
+    """
+    Rewrite an unescaped `.` outside character classes so it matches exactly one JSON
+    string character: anything but a quote, backslash or control character, or one JSON
+    escape sequence.
+
+    A schema `pattern` is applied to the raw text between the JSON string's quotes, so a
+    bare `.` would let the model emit `"` or a tab there and break the document. Escaped
+    dots and dots inside classes are left untouched.
+    """
+    result = []
+    index = 0
+    in_class = False
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\":
+            result.append(pattern[index:index + 2])
+            index += 2
+            continue
+        if in_class:
+            if char == "]":
+                in_class = False
+            result.append(char)
+        elif char == "[":
+            in_class = True
+            result.append(char)
+        elif char == ".":
+            result.append(_JSON_STRING_CHAR)
+        else:
+            result.append(char)
+        index += 1
+    return "".join(result)
+
+
 def kbnf_regex_term(pattern: str, *, leading_space: bool = True) -> str:
     """
     Wrap a raw regex pattern as a KBNF regex terminal, optionally allowing leading JSON whitespace.
@@ -236,7 +274,7 @@ def _register_all_predefined_types():
             return fr"""{nonterminal} ::= #'{SPACE_NONTERMINAL}"([^\\\\"\u0000-\u001f]|\\\\["\\\\bfnrt/]|\\\\u[0-9A-Fa-f]{{4}}){repetition}"';
 """, []
         if pattern is not None:
-            quoted_pattern = '"(?:' + pattern + ')"'  # group so a top-level `|` stays inside the quotes
+            quoted_pattern = '"(?:' + json_safe_pattern(pattern) + ')"'  # group so a top-level `|` stays inside the quotes
             return f"{nonterminal} ::= {kbnf_regex_term(quoted_pattern)};\n", []
         if substring_of is not None:
             return f"""{nonterminal} ::= #'{SPACE_NONTERMINAL}' '"' #substrs{repr(substring_of)} '"';\n""", []
