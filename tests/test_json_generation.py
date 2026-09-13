@@ -148,3 +148,32 @@ def test_bounded_arrays_keep_their_item_type():
     _assert_accepts(grammar, {"xs": ["a", "b", "c"]})
     _assert_rejects(grammar, '{"xs":["a"]}\n')
     _assert_rejects(grammar, '{"xs":[1,2]}\n')
+
+
+# ----------------------------------------------------------------- numeric ranges
+
+
+@pytest.mark.parametrize(
+    "schema, accepted, rejected",
+    [
+        ({"type": "integer", "minimum": 1, "maximum": 100}, ["1", "57", "100"], ["0", "101", "-5", "1.0"]),
+        ({"type": "integer", "exclusiveMinimum": 0}, ["1", "999999"], ["0", "-1"]),
+        ({"type": "integer", "minimum": -20, "exclusiveMaximum": -3}, ["-20", "-4"], ["-3", "-21", "0"]),
+        ({"type": "integer", "minimum": 0.5, "maximum": 2.5}, ["1", "2"], ["0", "3"]),
+        ({"type": "number", "minimum": 0.5}, ["0.5", "0.51", "1", "2.25", "1000000"], ["0.49", "0", "-1", "5e-1"]),
+        ({"type": "number", "exclusiveMinimum": 0, "maximum": 1}, ["0.001", "0.5", "1", "1.0"], ["0", "0.0", "1.01", "-0.5"]),
+        ({"type": "number", "minimum": -2.5, "maximum": 2.5}, ["-2.5", "-2.49", "0", "2.5", "1.999"], ["-2.51", "2.51"]),
+        ({"type": "number", "minimum": 0}, ["0", "0.0", "12.5"], ["-0.1", "-1"]),
+    ],
+)
+def test_numeric_ranges_are_enforced_textually(schema, accepted, rejected):
+    grammar = _grammar({"n": schema}, required=["n"])
+    for text in accepted:
+        assert _accepts(grammar, f'{{"n":{text}}}\n'), f"{schema} should accept {text}"
+    for text in rejected:
+        _assert_rejects(grammar, f'{{"n":{text}}}\n')
+
+
+def test_empty_numeric_range_is_reported():
+    with pytest.raises(ValueError, match="empty"):
+        _grammar({"n": {"type": "integer", "minimum": 5, "maximum": 4}}, required=["n"])

@@ -98,8 +98,11 @@ soon as schemas are untrusted, all fixed here:
 - **Bounded arrays.** `minItems`/`maxItems`/`prefixItems` dropped the item schema and
   accepted any JSON value.
 
-Non-zero numeric bounds (`minimum: 1`) remain unsupported by the generator and are
-reported as `invalid` rather than silently ignored.
+- **Numeric ranges.** Upstream only understood bounds at zero. `minimum`, `maximum`,
+  `exclusiveMinimum`, and `exclusiveMaximum` on integers and decimals are now compiled
+  into regexes over the number's text (`formatron.formats.numeric_range`), verified
+  against decimal arithmetic on 1.6 million probe values. Exponent notation is not
+  admitted for bounded numbers because its magnitude is not visible in a prefix.
 
 ### Proxy and benchmark
 

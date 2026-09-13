@@ -4,12 +4,14 @@ The module defines the `JsonExtractor` class, which is used to extract data from
 import collections
 import decimal
 import json
+import math
 import types
 import typing
 
 from frozendict import frozendict
 
 from formatron import extractor, schemas
+from formatron.formats.numeric_range import NumberBounds, integer_range_regex, number_range_regex
 from formatron.formats.utils import escape_identifier
 
 
@@ -244,26 +246,45 @@ def _register_all_predefined_types():
         ge = current.metadata.get("ge")
         lt = current.metadata.get("lt")
         le = current.metadata.get("le")
-        
-        prefix_map = {
-            (gt, 0): "",
-            (ge, 0): "0|",
-            (lt, 0): "-",
-            (le, 0): "0|-",
-        }
-        
-        for (condition, value), prefix in prefix_map.items():
-            if condition is not None and condition == value:
-                if issubclass(current.type, int):
-                    return f"""{nonterminal} ::= #'{SPACE_NONTERMINAL}{prefix}[1-9][0-9]*';\n""", []
-                elif issubclass(current.type, float):
-                    return f"""{nonterminal} ::= #'{SPACE_NONTERMINAL}{prefix}[1-9][0-9]*(\\\\.[0-9]+)?([eE][+-]?[0-9]+)?';\n""", []
-        if strict_schema:
-            raise ValueError(f"{current.type.__name__} metadata {current.metadata} is not supported in json_generators!")
-        else:
-            print(f"Warning: {current.type.__name__} metadata {current.metadata} is not supported in json_generators!")
+        if all(bound is None for bound in (gt, ge, lt, le)):
+            return None
+        for bound in (gt, ge, lt, le):
+            if bound is not None and (isinstance(bound, bool) or not isinstance(bound, (int, float, decimal.Decimal))
+                                      or (isinstance(bound, float) and not math.isfinite(bound))):
+                if strict_schema:
+                    raise ValueError(f"{current.type.__name__} bound {bound!r} is not a finite number")
+                print(f"Warning: {current.type.__name__} bound {bound!r} is not a finite number; ignoring bounds")
+                return "", [(current.type, nonterminal)]
+        as_decimal = lambda value: None if value is None else decimal.Decimal(str(value))
+        try:
+            if issubclass(current.type, int):
+                # Convert every bound to an inclusive integer bound.
+                lo = None
+                if ge is not None:
+                    lo = math.ceil(ge)
+                if gt is not None:
+                    lo_gt = math.floor(gt) + 1
+                    lo = lo_gt if lo is None else max(lo, lo_gt)
+                hi = None
+                if le is not None:
+                    hi = math.floor(le)
+                if lt is not None:
+                    hi_lt = math.ceil(lt) - 1
+                    hi = hi_lt if hi is None else min(hi, hi_lt)
+                pattern = integer_range_regex(lo, hi)
+            else:
+                lo_strict = gt is not None and (ge is None or as_decimal(gt) >= as_decimal(ge))
+                lo = as_decimal(gt) if lo_strict else as_decimal(ge)
+                hi_strict = lt is not None and (le is None or as_decimal(lt) <= as_decimal(le))
+                hi = as_decimal(lt) if hi_strict else as_decimal(le)
+                pattern = number_range_regex(NumberBounds(lo, hi, lo_strict, hi_strict))
+        except ValueError as error:
+            if strict_schema:
+                raise ValueError(f"{current.type.__name__} metadata {current.metadata}: {error}") from error
+            print(f"Warning: {current.type.__name__} metadata {current.metadata}: {error}; ignoring bounds")
             return "", [(current.type, nonterminal)]
-    
+        return f"{nonterminal} ::= {kbnf_regex_term(pattern)};\n", []
+
     def sequence_metadata(current: typing.Type, nonterminal: str):
         min_items = current.metadata.get("min_length")
         max_items = current.metadata.get("max_length")
