@@ -159,3 +159,4 @@ benchmarks/grammar_guard/results/*.jsonl
 
 # demo run logs; TRANSCRIPT.md is regenerated from them
 examples/grammar_guard_demo/logs/
+benchmarks/grammar_guard/results/*.pkl
